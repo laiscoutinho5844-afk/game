@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Teste da impressora PD01</title>
+<style>
+:root{--bg:#fff6f8;--fg:#3b2a32;--ac:#d9567f;--card:#ffffff;--bd:#efd3dc;--mut:#8a6f7a}
+@media(prefers-color-scheme:dark){:root{--bg:#1c1317;--fg:#f4e6ec;--ac:#f08ab0;--card:#2a1d23;--bd:#47333d;--mut:#b99aa8}}
+*{box-sizing:border-box}
+body{margin:0 auto;padding:18px;max-width:520px;font:16px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+h1{font-size:1.35rem;margin:0 0 4px}
+p{margin:0 0 14px;color:var(--mut)}
+button,.file{display:block;width:100%;margin:0 0 10px;padding:14px;border:0;border-radius:14px;background:var(--ac);color:#fff;font:600 1rem system-ui,sans-serif;text-align:center}
+button:disabled,.file.off{opacity:.4}
+.file input{display:none}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:12px 14px;margin:14px 0}
+label.r{display:flex;justify-content:space-between;gap:10px;font-size:.9rem;margin-top:8px}
+input[type=range]{width:100%;accent-color:var(--ac)}
+pre{height:190px;overflow:auto;margin:0;padding:10px;border-radius:12px;background:var(--card);border:1px solid var(--bd);font:12px/1.4 ui-monospace,monospace;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>Teste da impressora PD01</h1>
+<p>Use o Chrome no Android e feche o Fun Print antes de conectar.</p>
+
+<button id="bc">Conectar impressora</button>
+<button id="bt" disabled>Imprimir padrão de teste</button>
+<label class="file off" id="fl">Imprimir uma foto<input type="file" id="fi" accept="image/*" disabled></label>
+
+<div class="card">
+  <label class="r">Intensidade (energia) <b id="enV"></b></label>
+  <input type="range" id="en" min="4000" max="30000" step="500" value="12000">
+  <label class="r">Velocidade <b id="spV"></b></label>
+  <input type="range" id="sp" min="4" max="64" step="1" value="32">
+  <label class="r">Papel extra no fim <b id="fdV"></b></label>
+  <input type="range" id="fd" min="0" max="300" step="10" value="128">
+  <label class="r">Contraste da foto <b id="ctV"></b></label>
+  <input type="range" id="ct" min="0.6" max="2.4" step="0.1" value="1.2">
+  <label class="r">Brilho da foto <b id="brV"></b></label>
+  <input type="range" id="br" min="-60" max="60" step="5" value="0">
+</div>
+
+<pre id="log"></pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const log = m => { const l = $('log'); l.textContent += m + '\n'; l.scrollTop = 1e9; };
+const hex = v => [...v].map(b => b.toString(16).padStart(2, '0')).join(' ');
+
+/* Sliders mostram o valor atual */
+['en','sp','fd','ct','br'].forEach(k => {
+  const up = () => $(k + 'V').textContent = $(k).value;
+  $(k).addEventListener('input', up); up();
+});
+
+/* CRC8 (polinômio 0x07) e montagem de pacotes: 51 78 CMD 00 LEN_L LEN_H DADOS CRC FF */
+const T = new Uint8Array(256);
+for (let i = 0; i < 256; i++) { let c = i; for (let k = 0; k < 8; k++) c = (c & 128) ? ((c << 1) ^ 7) & 255 : (c << 1) & 255; T[i] = c; }
+const crc = d => d.reduce((c, b) => T[c ^ b], 0);
+const pkt = (cmd, d = []) => Uint8Array.from([0x51, 0x78, cmd, 0, d.length & 255, d.length >> 8, ...d, crc(d), 0xFF]);
+
+/* Bluetooth */
+let tx = null, paused = false, waiters = [], chunk = 128, busy = false;
+
+async function conectar() {
+  if (!navigator.bluetooth) { log('Este navegador não tem Web Bluetooth. Use o Chrome no Android ou no Windows.'); return; }
+  const dev = await navigator.bluetooth.requestDevice({
+    filters: [{ services: [0xAF30] }, { namePrefix: 'PD01' }],
+    optionalServices: [0xAE30]
+  });
+  dev.addEventListener('gattserverdisconnected', () => { tx = null; ui(false); log('Impressora desconectada.'); });
+  const srv = await dev.gatt.connect();
+  const svc = await srv.getPrimaryService(0xAE30);
+  tx = await svc.getCharacteristic(0xAE01);
+  const rx = await svc.getCharacteristic(0xAE02);
+  await rx.startNotifications();
+  rx.addEventListener('characteristicvaluechanged', e => {
+    const dv = e.target.value, v = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+    log('Impressora: ' + hex(v));
+    if (v[2] === 0xAE) { paused = v[6] === 0x10; if (!paused) waiters.splice(0).forEach(f => f()); }
+  });
+  ui(true);
+  log('Conectada a ' + (dev.name || 'PD01') + '.');
+}
+
+function ui(on) {
+  $('bt').disabled = !on; $('fi').disabled = !on;
+  $('fl').classList.toggle('off', !on);
+  $('bc').textContent = on ? 'Conectada (tocar para trocar)' : 'Conectar impressora';
+}
+
+async function enviar(bytes) {
+  for (let i = 0; i < bytes.length;) {
+    if (paused) { await new Promise(r => { waiters.push(r); setTimeout(r, 3000); }); paused = false; }
+    try {
+      await tx.writeValueWithoutResponse(bytes.subarray(i, i + chunk));
+      i += chunk;
+      await new Promise(r => setTimeout(r, 6));
+    } catch (e) {
+      if (chunk > 20) { chunk = 20; log('Blocos menores (20 bytes).'); } else throw e;
+    }
+  }
+}
+
+/* Imagem para linhas de 1 bit (384 px = 48 bytes), com dithering Floyd-Steinberg */
+function linhas(src, contraste, brilho) {
+  const W = 384, H = Math.max(1, Math.round(src.height * W / src.width));
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#fff'; cx.fillRect(0, 0, W, H); cx.drawImage(src, 0, 0, W, H);
+  const d = cx.getImageData(0, 0, W, H).data, g = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    const v = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2];
+    g[i] = Math.max(0, Math.min(255, (v - 128) * contraste + 128 + brilho));
+  }
+  for (let y = 0; y < H; y++) for (let px = 0; px < W; px++) {
+    const i = y * W + px, o = g[i], n = o < 128 ? 0 : 255, e = o - n;
+    g[i] = n;
+    if (px + 1 < W) g[i + 1] += e * 7 / 16;
+    if (y + 1 < H) {
+      if (px > 0) g[i + W - 1] += e * 3 / 16;
+      g[i + W] += e * 5 / 16;
+      if (px + 1 < W) g[i + W + 1] += e / 16;
+    }
+  }
+  const rows = [];
+  for (let y = 0; y < H; y++) {
+    const r = new Array(48).fill(0);
+    for (let px = 0; px < W; px++) if (g[y * W + px] === 0) r[px >> 3] |= 1 << (px & 7); /* pixel preto = 1, bit menos significativo à esquerda */
+    rows.push(r);
+  }
+  return rows;
+}
+
+async function imprimir(src) {
+  if (!tx) { log('Conecte a impressora primeiro.'); return; }
+  if (busy) { log('Aguarde a impressão atual terminar.'); return; }
+  busy = true;
+  try {
+    const rows = linhas(src, +$('ct').value, +$('br').value);
+    const en = +$('en').value, sp = +$('sp').value, fd = +$('fd').value;
+    log('Enviando ' + rows.length + ' linhas...');
+    const P = [
+      pkt(0xA3, [0]), pkt(0xA4, [0x32]), pkt(0xBD, [sp]), pkt(0xAF, [en & 255, en >> 8]),
+      pkt(0xBE, [1]), pkt(0xA9, [0]),
+      pkt(0xA6, [0xAA, 0x55, 0x17, 0x38, 0x44, 0x5F, 0x5F, 0x5F, 0x44, 0x38, 0x2C])
+    ];
+    rows.forEach(r => P.push(pkt(0xA2, r)));
+    P.push(pkt(0xA6, [0xAA, 0x55, 0x17, 0, 0, 0, 0, 0, 0, 0, 0x17]), pkt(0xBD, [8]), pkt(0xA1, [fd & 255, fd >> 8]), pkt(0xA3, [0]));
+    const all = new Uint8Array(P.reduce((n, p) => n + p.length, 0));
+    let o = 0; P.forEach(p => { all.set(p, o); o += p.length; });
+    await enviar(all);
+    log('Dados enviados. Aguarde a impressora terminar.');
+  } finally { busy = false; }
+}
+
+function padrao() {
+  const c = document.createElement('canvas'); c.width = 384; c.height = 320;
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, 384, 320);
+  g.strokeStyle = '#000'; g.lineWidth = 4; g.strokeRect(2, 2, 380, 316);
+  g.fillStyle = '#000'; g.font = 'bold 22px sans-serif'; g.fillText('TESTE PD01 - 384 px', 24, 44);
+  const gr = g.createLinearGradient(24, 0, 360, 0); gr.addColorStop(0, '#000'); gr.addColorStop(1, '#fff');
+  g.fillStyle = gr; g.fillRect(24, 64, 336, 56);
+  for (let i = 0; i < 8; i++) { g.fillStyle = 'hsl(0,0%,' + (i * 13) + '%)'; g.fillRect(24 + i * 42, 134, 42, 40); }
+  g.lineWidth = 1;
+  for (let i = 0; i < 16; i++) { g.beginPath(); g.moveTo(24 + i * 21 + .5, 190); g.lineTo(24 + i * 21 + .5, 300); g.stroke(); }
+  return c;
+}
+
+const run = f => async (...a) => { try { await f(...a); } catch (e) { log('Erro: ' + e.message); } };
+$('bc').onclick = run(conectar);
+$('bt').onclick = run(() => imprimir(padrao()));
+$('fi').onchange = run(async e => { const f = e.target.files[0]; if (f) await imprimir(await createImageBitmap(f)); e.target.value = ''; });
+log('Pronto. Toque em "Conectar impressora".');
+</script>
+</body>
+</html>
