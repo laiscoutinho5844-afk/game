@@ -18,6 +18,8 @@ button:disabled,.file.off{opacity:.4}
 label.r{display:flex;justify-content:space-between;gap:10px;font-size:.9rem;margin-top:8px}
 input[type=range]{width:100%;accent-color:var(--ac)}
 pre{height:190px;overflow:auto;margin:0;padding:10px;border-radius:12px;background:var(--card);border:1px solid var(--bd);font:12px/1.4 ui-monospace,monospace;white-space:pre-wrap}
+select{width:100%;margin-top:4px;padding:10px;border-radius:10px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font:1rem system-ui,sans-serif}
+label.c{display:flex;gap:8px;align-items:center;font-size:.9rem;margin-top:10px}
 </style>
 </head>
 <body>
@@ -39,6 +41,16 @@ pre{height:190px;overflow:auto;margin:0;padding:10px;border-radius:12px;backgrou
   <input type="range" id="ct" min="0.6" max="2.4" step="0.1" value="1.2">
   <label class="r">Brilho da foto <b id="brV"></b></label>
   <input type="range" id="br" min="-60" max="60" step="5" value="0">
+  <label class="r">Nitidez <b id="ntV"></b></label>
+  <input type="range" id="nt" min="0" max="1.5" step="0.1" value="0.6">
+  <label class="r">Clarear tons médios (gama) <b id="gmV"></b></label>
+  <input type="range" id="gm" min="0.6" max="1.3" step="0.05" value="0.9">
+  <label class="r">Método de pontilhado</label>
+  <select id="alg"><option value="fs">Floyd-Steinberg serpentina</option><option value="atk">Atkinson</option><option value="bayer">Ordenado (Bayer 8x8)</option><option value="jjn">Jarvis-Judice-Ninke</option></select>
+  <label class="c"><input type="checkbox" id="gi" checked> Girar fotos horizontais 90° (mais resolução)</label>
+  <label class="c"><input type="checkbox" id="au" checked> Ajuste automático de níveis</label>
+  <label class="r">Ao escolher a foto</label>
+  <select id="md"><option value="foto">Imprimir a foto</option><option value="cmp">Imprimir comparação dos 4 métodos</option></select>
 </div>
 
 <pre id="log"></pre>
@@ -49,7 +61,7 @@ const log = m => { const l = $('log'); l.textContent += m + '\n'; l.scrollTop = 
 const hex = v => [...v].map(b => b.toString(16).padStart(2, '0')).join(' ');
 
 /* Sliders mostram o valor atual */
-['en','sp','fd','ct','br'].forEach(k => {
+['en','sp','fd','ct','br','nt','gm'].forEach(k => {
   const up = () => $(k + 'V').textContent = $(k).value;
   $(k).addEventListener('input', up); up();
 });
@@ -103,42 +115,109 @@ async function enviar(bytes) {
   }
 }
 
-/* Imagem para linhas de 1 bit (384 px = 48 bytes), com dithering Floyd-Steinberg */
-function linhas(src, contraste, brilho) {
-  const W = 384, H = Math.max(1, Math.round(src.height * W / src.width));
-  const c = document.createElement('canvas'); c.width = W; c.height = H;
-  const cx = c.getContext('2d');
-  cx.fillStyle = '#fff'; cx.fillRect(0, 0, W, H); cx.drawImage(src, 0, 0, W, H);
-  const d = cx.getImageData(0, 0, W, H).data, g = new Float32Array(W * H);
-  for (let i = 0; i < W * H; i++) {
-    const v = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2];
-    g[i] = Math.max(0, Math.min(255, (v - 128) * contraste + 128 + brilho));
+/* Processamento de imagem para papel térmico (384 px = 48 bytes por linha) */
+const W = 384;
+const K = {
+  fs:  { d: 16, k: [[1,0,7],[-1,1,3],[0,1,5],[1,1,1]] },
+  atk: { d: 8,  k: [[1,0,1],[2,0,1],[-1,1,1],[0,1,1],[1,1,1],[0,2,1]] },
+  jjn: { d: 48, k: [[1,0,7],[2,0,5],[-2,1,3],[-1,1,5],[0,1,7],[1,1,5],[2,1,3],[-2,2,1],[-1,2,3],[0,2,5],[1,2,3],[2,2,1]] }
+};
+const cl = v => Math.max(0, Math.min(255, v));
+const opcoes = (x = {}) => ({
+  ct: +$('ct').value, br: +$('br').value, nit: +$('nt').value, gm: +$('gm').value,
+  alg: $('alg').value, girar: $('gi').checked, auto: $('au').checked, ...x
+});
+
+function bayer(n) {
+  let m = [[0]];
+  while (m.length < n) {
+    const s = m.length, r = [], q = [[0, 2], [3, 1]];
+    for (let y = 0; y < 2 * s; y++) { r.push([]); for (let x = 0; x < 2 * s; x++) r[y].push(m[y % s][x % s] * 4 + q[(y / s) | 0][(x / s) | 0]); }
+    m = r;
   }
-  for (let y = 0; y < H; y++) for (let px = 0; px < W; px++) {
-    const i = y * W + px, o = g[i], n = o < 128 ? 0 : 255, e = o - n;
-    g[i] = n;
-    if (px + 1 < W) g[i + 1] += e * 7 / 16;
-    if (y + 1 < H) {
-      if (px > 0) g[i + W - 1] += e * 3 / 16;
-      g[i + W] += e * 5 / 16;
-      if (px + 1 < W) g[i + W + 1] += e / 16;
+  return m;
+}
+
+/* Redução em etapas com suavização de alta qualidade, até 384 px de largura */
+function reduzir(s) {
+  let c = s;
+  while (c.width >= W * 2) {
+    const n = document.createElement('canvas'); n.width = Math.floor(c.width / 2); n.height = Math.floor(c.height / 2);
+    const x = n.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(c, 0, 0, n.width, n.height); c = n;
+  }
+  const f = document.createElement('canvas'); f.width = W; f.height = Math.max(1, Math.round(c.height * W / c.width));
+  const x = f.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, W, f.height);
+  x.imageSmoothingQuality = 'high'; x.drawImage(c, 0, 0, W, f.height);
+  return f;
+}
+
+/* Cinza, níveis automáticos, nitidez, contraste/brilho e gama */
+function preparar(src, o) {
+  let s = src;
+  if (o.girar && src.width > src.height) {
+    s = document.createElement('canvas'); s.width = src.height; s.height = src.width;
+    const x = s.getContext('2d'); x.translate(src.height, 0); x.rotate(Math.PI / 2); x.drawImage(src, 0, 0);
+  }
+  const f = reduzir(s), H = f.height, n = W * H;
+  const d = f.getContext('2d').getImageData(0, 0, W, H).data, g = new Float32Array(n);
+  for (let i = 0; i < n; i++) g[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2];
+  if (o.auto) {
+    const h = new Uint32Array(256); for (let i = 0; i < n; i++) h[g[i] | 0]++;
+    let a = 0, lo = 0, hi = 255;
+    while (lo < 255 && (a += h[lo]) < n * 0.01) lo++;
+    a = 0; while (hi > 0 && (a += h[hi]) < n * 0.01) hi--;
+    if (hi - lo > 20) for (let i = 0; i < n; i++) g[i] = cl((g[i] - lo) * 255 / (hi - lo));
+  }
+  if (o.nit > 0) {
+    const b = new Float32Array(n);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      let t = 0;
+      for (let j = -1; j <= 1; j++) { const yy = Math.min(H - 1, Math.max(0, y + j)); for (let i = -1; i <= 1; i++) t += g[yy * W + Math.min(W - 1, Math.max(0, x + i))]; }
+      b[y * W + x] = t / 9;
+    }
+    for (let i = 0; i < n; i++) g[i] = cl(g[i] + o.nit * (g[i] - b[i]));
+  }
+  for (let i = 0; i < n; i++) g[i] = 255 * Math.pow(cl((g[i] - 128) * o.ct + 128 + o.br) / 255, o.gm);
+  return { g, H };
+}
+
+/* Pontilhado: difusão de erro em serpentina ou ordenado. Deixa só 0 (preto) e 255 (branco) */
+function pontilhar(g, H, alg) {
+  if (alg === 'bayer') {
+    const B = bayer(8);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) g[y * W + x] = g[y * W + x] < (B[y & 7][x & 7] + 0.5) * 255 / 64 ? 0 : 255;
+    return;
+  }
+  const { d, k } = K[alg];
+  for (let y = 0; y < H; y++) {
+    const rev = y & 1;
+    for (let t = 0; t < W; t++) {
+      const x = rev ? W - 1 - t : t, i = y * W + x, o = g[i], v = o < 128 ? 0 : 255, e = o - v;
+      g[i] = v;
+      for (const [dx, dy, w] of k) {
+        const xx = x + (rev ? -dx : dx), yy = y + dy;
+        if (xx >= 0 && xx < W && yy < H) g[yy * W + xx] += e * w / d;
+      }
     }
   }
+}
+
+/* Cada linha vira 48 bytes: pixel preto = 1, pixel mais à esquerda no bit menos significativo */
+function empacotar(g, H) {
   const rows = [];
   for (let y = 0; y < H; y++) {
     const r = new Array(48).fill(0);
-    for (let px = 0; px < W; px++) if (g[y * W + px] === 0) r[px >> 3] |= 1 << (px & 7); /* pixel preto = 1, bit menos significativo à esquerda */
+    for (let x = 0; x < W; x++) if (g[y * W + x] === 0) r[x >> 3] |= 1 << (x & 7);
     rows.push(r);
   }
   return rows;
 }
 
-async function imprimir(src) {
+async function imprimirLinhas(rows) {
   if (!tx) { log('Conecte a impressora primeiro.'); return; }
   if (busy) { log('Aguarde a impressão atual terminar.'); return; }
   busy = true;
   try {
-    const rows = linhas(src, +$('ct').value, +$('br').value);
     const en = +$('en').value, sp = +$('sp').value, fd = +$('fd').value;
     log('Enviando ' + rows.length + ' linhas...');
     const P = [
@@ -153,6 +232,23 @@ async function imprimir(src) {
     await enviar(all);
     log('Dados enviados. Aguarde a impressora terminar.');
   } finally { busy = false; }
+}
+
+async function imprimir(src, extra) {
+  const o = opcoes(extra), { g, H } = preparar(src, o);
+  pontilhar(g, H, o.alg);
+  await imprimirLinhas(empacotar(g, H));
+}
+
+/* Folha de comparação: a mesma faixa central da foto com 4 métodos (1 a 4 riscos antes de cada faixa) */
+async function comparar(src) {
+  const o = opcoes(), { g, H } = preparar(src, o), h = Math.min(150, H), ini = (H - h) >> 1, rows = [];
+  ['fs', 'atk', 'bayer', 'jjn'].forEach((alg, k) => {
+    for (let j = 0; j <= k; j++) rows.push(new Array(48).fill(255), new Array(48).fill(255), ...[0, 1, 2].map(() => new Array(48).fill(0)));
+    const b = g.slice(ini * W, (ini + h) * W); pontilhar(b, h, alg); rows.push(...empacotar(b, h));
+  });
+  log('Comparação: 1 risco = Floyd-Steinberg, 2 = Atkinson, 3 = Ordenado, 4 = Jarvis.');
+  await imprimirLinhas(rows);
 }
 
 function padrao() {
@@ -171,8 +267,12 @@ function padrao() {
 
 const run = f => async (...a) => { try { await f(...a); } catch (e) { log('Erro: ' + e.message); } };
 $('bc').onclick = run(conectar);
-$('bt').onclick = run(() => imprimir(padrao()));
-$('fi').onchange = run(async e => { const f = e.target.files[0]; if (f) await imprimir(await createImageBitmap(f)); e.target.value = ''; });
+$('bt').onclick = run(() => imprimir(padrao(), { girar: false, auto: false, nit: 0 }));
+$('fi').onchange = run(async e => {
+  const f = e.target.files[0];
+  if (f) { const b = await createImageBitmap(f); await ($('md').value === 'cmp' ? comparar(b) : imprimir(b)); }
+  e.target.value = '';
+});
 log('Pronto. Toque em "Conectar impressora".');
 </script>
 </body>
