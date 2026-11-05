@@ -54,12 +54,14 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:syste
 <h2>Configuração do Photobooth</h2>
 <h3>Câmera</h3><select id="cam"></select>
 <label><span><input type="checkbox" id="es"> Espelhar a prévia</span></label>
+<small>No notebook, aperte a barra de espaço para tirar a foto.</small>
 <h3>Impressora PD01</h3>
 <button id="bi">Conectar impressora</button><small id="si">Feche o Fun Print antes. Toque a cada vez que abrir o aplicativo.</small>
 <label>Intensidade (energia)</label><input type="range" id="en" min="4000" max="30000" step="500">
 <label>Contraste</label><input type="range" id="ct" min="0.6" max="2.4" step="0.1">
 <label>Papel extra no fim</label><input type="range" id="fd" min="0" max="300" step="10">
-<label><span><input type="checkbox" id="gi"> Girar fotos horizontais 90°</span></label>
+<label><span><input type="checkbox" id="gi"> Girar a foto horizontal 90° na impressão (usa mais área do papel)</span></label>
+<select id="gd" style="margin-top:6px"><option value="cw">Girar para a direita</option><option value="ccw">Girar para a esquerda</option></select>
 <h3>Google Drive</h3>
 <input type="text" id="cid" placeholder="Client ID do Google (OAuth)">
 <input type="text" id="pa" placeholder="Nome da pasta" style="margin-top:8px">
@@ -72,7 +74,9 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:syste
 const $ = id => document.getElementById(id);
 const esperar = ms => new Promise(r => setTimeout(r, ms));
 const cl = v => Math.max(0, Math.min(255, v));
-const cfg = Object.assign({ cam: '', cid: '', pasta: 'Photobooth', fid: '', en: 12000, fd: 128, ct: 1.2, girar: false, esp: true }, (() => { try { return JSON.parse(localStorage.pb || '{}'); } catch (e) { return {}; } })());
+const salvo = (() => { try { return JSON.parse(localStorage.pb || '{}'); } catch (e) { return {}; } })();
+const cfg = Object.assign({ cam: '', cid: '', pasta: 'Photobooth', fid: '', en: 12000, fd: 128, ct: 1.2, girar: true, gdir: 'cw', esp: true }, salvo);
+if (salvo.gdir === undefined) { cfg.girar = true; cfg.gdir = 'cw'; }
 const salvar = () => { try { localStorage.pb = JSON.stringify(cfg); } catch (e) {} };
 function aviso(m) { const t = $('ts'); t.textContent = m; t.classList.add('on'); clearTimeout(aviso.t); aviso.t = setTimeout(() => t.classList.remove('on'), 4500); }
 const exec = f => async () => { try { await f(); } catch (e) { aviso(e.message); } };
@@ -181,7 +185,7 @@ function reduzir(s) {
 /* Configuração inicial aprovada: contraste, Floyd-Steinberg, 384 px */
 function linhas(src) {
   let s = src;
-  if (cfg.girar && src.width > src.height) { s = document.createElement('canvas'); s.width = src.height; s.height = src.width; const x = s.getContext('2d'); x.translate(src.height, 0); x.rotate(Math.PI / 2); x.drawImage(src, 0, 0); }
+  if (cfg.girar && src.width > src.height) { s = document.createElement('canvas'); s.width = src.height; s.height = src.width; const x = s.getContext('2d'); if (cfg.gdir === 'ccw') { x.translate(0, src.width); x.rotate(-Math.PI / 2); } else { x.translate(src.height, 0); x.rotate(Math.PI / 2); } x.drawImage(src, 0, 0); }
   const f = reduzir(s), H = f.height, d = f.getContext('2d').getImageData(0, 0, W, H).data, g = new Float32Array(W * H);
   for (let i = 0; i < W * H; i++) g[i] = cl((0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2] - 128) * cfg.ct + 128);
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
@@ -239,6 +243,7 @@ $('cid').onchange = () => { cfg.cid = $('cid').value.trim(); salvar(); };
 $('pa').onchange = () => { cfg.pasta = $('pa').value.trim() || 'Photobooth'; cfg.fid = ''; salvar(); };
 ['en', 'ct', 'fd'].forEach(k => $(k).oninput = () => { cfg[k] = +$(k).value; salvar(); });
 $('gi').onchange = () => { cfg.girar = $('gi').checked; salvar(); };
+$('gd').value = cfg.gdir; $('gd').onchange = () => { cfg.gdir = $('gd').value; salvar(); };
 $('es').onchange = () => { cfg.esp = $('es').checked; salvar(); espelho(); };
 $('cam').onchange = exec(async () => { cfg.cam = $('cam').value; salvar(); await camera(); });
 $('bi').onclick = exec(async () => { await pedirImpressora(); $('si').textContent = 'Impressora conectada.'; rodarImpressao(); });
@@ -247,7 +252,8 @@ $('ok').onclick = () => { $('pn').hidden = true; };
 $('cfg').onclick = () => { $('pn').hidden = false; };
 $('fs').onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
 $('st').onclick = foto;
-addEventListener('keydown', e => { if (e.code === 'Space' && $('pn').hidden) { e.preventDefault(); foto(); } });
+addEventListener('keydown', e => { if (e.code === 'Space' && $('pn').hidden) { e.preventDefault(); if (!e.repeat) foto(); } }, true);
+addEventListener('keyup', e => { if (e.code === 'Space' && $('pn').hidden) e.preventDefault(); }, true);
 addEventListener('online', rodarDrive); setInterval(rodarDrive, 15000); setInterval(rodarImpressao, 20000);
 const tela = () => { try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => {}); } catch (e) {} };
 tela(); document.addEventListener('visibilitychange', () => { if (!document.hidden) tela(); });
